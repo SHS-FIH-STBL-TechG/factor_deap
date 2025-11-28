@@ -1,86 +1,78 @@
 # src/ai_clients/qwen_client.py
 """
-通义千问（DashScope）API 封装：
-- 使用 qwen-max（高阶 / 推理较强的模型）
-- 暴露 ask_qwen(user_prompt) -> str
+通义千问（DashScope）简单封装：
+- 使用 text-generation 接口
+- 模型：qwen-max（思考模型）
+- 返回的数据结构形如：
+  {
+    "output": {
+      "text": "...",
+      "finish_reason": "stop"
+    },
+    "usage": {...},
+    "request_id": "..."
+  }
 """
 
 import os
 import json
 import requests
-from typing import Optional
 
-# 阿里云百炼的 API Key，一般是 DASHSCOPE_API_KEY
-QWEN_API_KEY = os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY")
-QWEN_MODEL = "qwen-max"  # 高阶 / 推理较强
-QWEN_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+from logging_utils import get_logger
 
+logger = get_logger("qwen_client")
 
-class QwenError(RuntimeError):
-    pass
+DASHSCOPE_API_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
 
 
-def ask_qwen(user_prompt: str, timeout: int = 60) -> str:
+def _get_api_key() -> str:
+    key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY")
+    if not key:
+        raise RuntimeError("未找到通义千问 API Key，请设置环境变量 DASHSCOPE_API_KEY 或 QWEN_API_KEY")
+    return key
+
+
+def ask_qwen(prompt: str) -> str:
     """
-    调用通义千问 qwen-max 模型，返回字符串形式的回复内容。
-
-    参数:
-        user_prompt:  你的完整提示词（这里直接用 ai_factor_ideation 里构造的 JSON 提示词）
-        timeout:      请求超时时间（秒）
-
-    返回:
-        模型回复的内容（string）
+    向通义千问发送 prompt，返回字符串形式的回复。
+    要求模型以纯文本形式输出（这里我们再去解析 JSON）。
     """
-    if not QWEN_API_KEY:
-        raise QwenError("未找到通义千问 API Key，请在环境变量 DASHSCOPE_API_KEY 或 QWEN_API_KEY 中配置。")
+    api_key = _get_api_key()
 
     headers = {
-        "Authorization": f"Bearer {QWEN_API_KEY}",
         "Content-Type": "application/json",
-        "X-DashScope-SSE": "disable",
+        "Authorization": f"Bearer {api_key}",
     }
-
-    # 这里统一加一个 system 角色，告诉它你是量化研究员 & 严格输出 JSON
-    system_prompt = (
-        "你是一名擅长中国A股日频量化因子设计的研究员，必须严格按照用户要求返回 JSON 格式。"
-    )
 
     payload = {
-        "model": QWEN_MODEL,
-        "input": {
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-        },
+        "model": "qwen-max",  # 思考能力较强的大模型
+        "input": prompt,
         "parameters": {
-            # 结果格式设为 text，方便直接拿 content
+            # 明确要求返回纯文本（对应你日志里的 output.text）
             "result_format": "text",
-            "temperature": 0.2,
         },
     }
 
-    resp = requests.post(
-        QWEN_URL,
-        headers=headers,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        timeout=timeout,
-    )
+    resp = requests.post(DASHSCOPE_API_URL, headers=headers, data=json.dumps(payload), timeout=60)
 
     if resp.status_code != 200:
-        raise QwenError(
-            f"Qwen API 返回错误状态码 {resp.status_code}: {resp.text}"
+        raise RuntimeError(
+            f"Qwen HTTP {resp.status_code}: {resp.text[:200]}"
         )
 
     try:
         data = resp.json()
     except Exception as e:
-        raise QwenError(f"解析 Qwen 返回的 JSON 失败: {e}, 文本={resp.text[:200]}")
+        raise RuntimeError(f"Qwen 返回不是合法 JSON：{e}, 原始响应前 200 字符: {resp.text[:200]}")
 
-    # DashScope 返回结构一般是 output -> choices -> [ { message: { content: ... } } ]
+    # 优先走 output.text（与你日志中的结构一致）
     try:
-        content: str = data["output"]["choices"][0]["message"]["content"]
+        output = data.get("output", {})
+        text = output.get("text")
+        if not isinstance(text, str):
+            raise KeyError("output.text 缺失或不是字符串")
+        return text
     except Exception as e:
-        raise QwenError(f"Qwen 返回结构异常，无法提取 content: {e}, data={data}")
-
-    return content
+        # 兜底：如果未来 DashScope 又改结构，这里打印一份完整 data 方便你排查
+        logger.error("Qwen 返回结构异常，无法提取 output.text: %s, data=%s", e, data)
+        raise RuntimeError(f"Qwen 返回结构异常，无法提取 output.text: {e}")

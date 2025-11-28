@@ -2,24 +2,24 @@
 """
 对 AI 生成的因子做全量组合扫描：
 - data/ 目录下每个 csv 单独处理
-- 只使用 AI 自动生成的因子（来自 factors_generated.json）
-- 穷举 2~10 个因子的所有组合
+- 只使用 AI 自动生成的因子（factors_generated.GENERATED_FACTORS）
+- 穷举 2~K 个因子的所有组合（K 可配置，默认 5）
 - 对每个组合：
     * 算全样本 Pearson 相关系数 corr_full
     * 算滑窗 IC 序列，取 |IC| 均值 ic_abs_mean
 - 条件：ic_abs_mean > ic_threshold 或 corr_full > corr_threshold
 - 如果没有任何组合满足，输出 ic_abs_mean 最大的组合
-- 每个 (csv, 因子组合) 的结果会缓存到 results/factor_combo_cache.json
+- 每个 (csv, 因子组合) 的结果会缓存到 results/factor_combo_cache.json.gz
   下次运行遇到相同组合就不再重复计算。
 """
-import gzip
+
 import itertools
 import json
+import gzip
 from pathlib import Path
 from typing import List, Dict, Any
 
 import pandas as pd
-import warnings
 
 # 日志：优先使用你项目里的 logging_utils
 try:
@@ -38,22 +38,23 @@ except ImportError:  # 兜底
         logger.addHandler(h)
         return logger
 
-# 从自动因子模块里拿 AI 因子加载函数 + 执行函数
+# 从自动因子模块里拿 AI 因子定义 + 执行函数
 try:
-    from factors_generated import load_generated_factors, add_generated_factors
+    from factors_generated import GENERATED_FACTORS, add_generated_factors
 except ImportError:
-    def load_generated_factors() -> List[Dict[str, Any]]:
-        print("WARNING: 未找到 factors_generated.py，视为没有 AI 因子。")
-        return []
+    GENERATED_FACTORS = []
 
     def add_generated_factors(df: pd.DataFrame) -> pd.DataFrame:
         print("WARNING: 未找到 factors_generated.py，跳过 AI 因子。")
         return df
 
-
 logger = get_logger("ai_factor_ic_scan")
 
 TARGET_COL = "未来1日涨跌幅"
+
+# 控制组合枚举规模，避免 26 因子全组合爆炸
+MAX_COMBO_K = 5               # 每组最多因子个数
+MAX_COMBOS_PER_SYMBOL = 100000  # 每个标的最多评估多少个组合
 
 
 # ===== 工具函数 =====
@@ -64,26 +65,59 @@ def project_root() -> Path:
 
 
 def cache_path() -> Path:
-    """组合结果缓存文件路径"""
+    """
+    组合结果缓存文件路径（使用 gzip 压缩）
+    文件名：factor_combo_cache.json.gz
+    """
     root = project_root()
     result_dir = root / "results"
     result_dir.mkdir(exist_ok=True)
-    return result_dir / "factor_combo_cache.json"
+    return result_dir / "factor_combo_cache.json.gz"
 
 
 def load_cache() -> Dict[str, Dict[str, Any]]:
-    ...
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    ...
+    """
+    从 gzip JSON 加载缓存：
+    结构：
+    {
+      "symbol1": {
+        "因子A|因子B|因子C": {
+          "factors": [...],
+          "corr_full": 0.123,
+          "ic_abs_mean": 0.15,
+          "ic_mean": 0.08,
+          "ic_std": 0.02
+        },
+        ...
+      },
+      "symbol2": { ... }
+    }
+    """
+    p = cache_path()
+    if not p.exists():
+        return {}
+    try:
+        with gzip.open(p, "rt", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        else:
+            logger.warning("缓存文件 %s 内容不是 dict，忽略。", p)
+            return {}
+    except Exception as e:
+        logger.warning("读取缓存文件 %s 失败，将重新生成。详情: %s", p, e)
+        return {}
 
 
 def save_cache(cache: Dict[str, Dict[str, Any]]) -> None:
-    """把缓存写回 JSON"""
-    path = cache_path()
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
-    logger.info("缓存已写入：%s", path)
+    """把缓存写回 gzip JSON"""
+    p = cache_path()
+    try:
+        with gzip.open(p, "wt", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        logger.info("缓存已写入：%s", p)
+    except Exception as e:
+        logger.error("写入缓存文件 %s 失败：%s", p, e)
 
 
 def load_kline_data_for_file(csv_path: Path) -> pd.DataFrame:
@@ -139,11 +173,11 @@ def load_kline_data_for_file(csv_path: Path) -> pd.DataFrame:
     # 5. 手工基础因子（和 factor_ga.py 里的保持一致）
     df["因子_振幅"] = (df["最高点位"] - df["最低点位"]) / df["收盘价"]
     df["因子_实体占振幅"] = (df["收盘价"] - df["开盘点位"]).abs() / df["收盘价"]
-    df["因子_成交额变化率"] = df["成交额(万元)"].pct_change(fill_method=None)
-    df["因子_成交量变化率"] = df["成交量(万股)"].pct_change(fill_method=None)
+    df["因子_成交额变化率"] = df["成交额(万元)"].pct_change()
+    df["因子_成交量变化率"] = df["成交量(万股)"].pct_change()
     df["因子_当日涨跌幅"] = df["涨跌幅(%)"]
 
-    # 6. AI 自动生成因子（来自 factors_generated.json）
+    # 6. AI 自动生成因子
     df = add_generated_factors(df)
 
     # 7. 只删掉目标缺失（最后一行）
@@ -157,17 +191,14 @@ def load_kline_data_for_file(csv_path: Path) -> pd.DataFrame:
 
 def get_ai_factor_names(df: pd.DataFrame) -> List[str]:
     """
-    从 factors_generated.json 中：
-    - 读取 AI 因子定义列表
+    从 GENERATED_FACTORS 中：
     - 找出真正存在于 df.columns 的 AI 因子列名
     - 同时打印出哪些定义了但没算出来（方便排查）
     """
-    generated_factors = load_generated_factors()
-
     names: List[str] = []
     missing: List[str] = []
 
-    for fac in generated_factors:
+    for fac in GENERATED_FACTORS:
         name = fac.get("name")
         if not isinstance(name, str):
             continue
@@ -180,22 +211,21 @@ def get_ai_factor_names(df: pd.DataFrame) -> List[str]:
 
     logger.info(
         "AI 因子定义总数: %d, 在当前 df 中实际存在的: %d, 计算失败/未生成的: %d",
-        len(generated_factors),
+        len(GENERATED_FACTORS),
         len(names),
         len(missing),
     )
     if missing:
-        logger.info(
-            "以下 AI 因子在 df.columns 中没有找到（可能计算失败或代码有误）：%s",
-            missing,
-        )
+        logger.info("以下 AI 因子在 df.columns 中没有找到（可能计算失败或代码有误）：%s", missing)
 
     return names
 
 
-def evaluate_combo(df: pd.DataFrame,
-                   factor_names: List[str],
-                   window: int = 252) -> Dict[str, Any]:
+def evaluate_combo(
+    df: pd.DataFrame,
+    factor_names: List[str],
+    window: int = 252,
+) -> Dict[str, Any]:
     """
     对给定的一组因子名称，计算：
     - 全样本 Pearson 相关系数 corr_full
@@ -208,11 +238,7 @@ def evaluate_combo(df: pd.DataFrame,
     X = df[factor_names].astype(float)
 
     # z-score 标准化
-    # 这里用 warnings.catch_warnings 把 pandas 内部的 RuntimeWarning 静音，
-    # 防止控制台刷屏，但真正的异常（比如语法错误）还是会抛出来。
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        X = (X - X.mean()) / X.std(ddof=0)
+    X = (X - X.mean()) / X.std(ddof=0)
 
     combo = X.mean(axis=1)
     if combo.isna().all():
@@ -257,18 +283,13 @@ def scan_ai_factor_combinations_for_df(
 ):
     """
     针对一个 df（一个 csv），只用 AI 因子：
-    - 穷举所有 2~MAX_COMBO_K 个因子组合（如果因子数量不足，就到 len(ai_factors)）
+    - 穷举所有 2~K 个因子组合（K = MAX_COMBO_K；如果因子数量不足，就到 len(ai_factors)）
     - 计算全样本 Pearson 和滑窗 |IC| 均值
     - 条件：ic_abs_mean > ic_threshold 或 corr_full > corr_threshold
     - 如果一个也没有，就输出 ic_abs_mean 最大的那个组合
 
     组合结果缓存到 cache[symbol_name] 下，key 为 "因子A|因子B|..."。
     """
-    # 最大组合因子个数（原来是 10，这里先收紧到 5）
-    MAX_COMBO_K = 5
-    # 每个标的最多评估多少个组合，防止组合数量爆炸
-    MAX_COMBOS_PER_SYMBOL = 100000
-
     ai_factors = get_ai_factor_names(df)
     logger.info("标的 %s 的 AI 因子数量：%d", symbol_name, len(ai_factors))
 
@@ -285,20 +306,16 @@ def scan_ai_factor_combinations_for_df(
     passed: List[Dict[str, Any]] = []
     best_overall: Dict[str, Any] | None = None
 
-    evaluated_count = 0  # 已评估的组合数量计数器
+    combos_evaluated = 0
+    stop_early = False
 
     for k in range(2, max_k + 1):
+        if stop_early:
+            break
         logger.info("  枚举 %d 个因子的组合...", k)
         for combo_names in itertools.combinations(ai_factors, k):
-            if evaluated_count >= MAX_COMBOS_PER_SYMBOL:
-                logger.info(
-                    "  已达到该标的的组合评估上限 %d 个，提前停止穷举。",
-                    MAX_COMBOS_PER_SYMBOL,
-                )
-                break
-
             combo_list = list(combo_names)
-            key = "|".join(combo_list)  # 组合的唯一标识（与因子顺序无关，因为组合是按排序来的）
+            key = "|".join(combo_list)  # 组合的唯一标识
 
             if key in symbol_cache:
                 res = symbol_cache[key]
@@ -307,7 +324,15 @@ def scan_ai_factor_combinations_for_df(
                 symbol_cache[key] = res
                 cache_changed = True
 
-            evaluated_count += 1
+            combos_evaluated += 1
+            if combos_evaluated >= MAX_COMBOS_PER_SYMBOL:
+                logger.warning(
+                    "标的 %s 已评估组合数量达到上限 %d，提前停止枚举。",
+                    symbol_name,
+                    MAX_COMBOS_PER_SYMBOL,
+                )
+                stop_early = True
+                break
 
             ic_abs = res["ic_abs_mean"]
             corr_full = res["corr_full"]
@@ -327,19 +352,12 @@ def scan_ai_factor_combinations_for_df(
             if cond_ic or cond_corr:
                 passed.append(res)
 
-        else:
-            # 内层 for 正常走完才会到这里；如果是 break 跳出来，这个 else 不会执行
-            continue
-
-        # 如果内层 for 被 break（组合数达到上限），这里 break 外层
-        break
-
     # 更新 cache
     cache[symbol_name] = symbol_cache
     if cache_changed:
         logger.info("标的 %s 的组合结果已更新缓存。", symbol_name)
 
-    logger.info("=== 标的 %s 穷举结果 ===", symbol_name)
+    logger.info("=== 标的 %s 穷举结果（共评估组合 %d 个） ===", symbol_name, combos_evaluated)
 
     if passed:
         passed_sorted = sorted(
