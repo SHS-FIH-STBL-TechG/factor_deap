@@ -1,0 +1,72 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# debug information files
+*.dwo
+
+# clion files
+cmake-build-*/
+.idea/
+
+# pycharm files
+.venv/
+
+# VSCode 配置文件
+.vscode/
+
+# CMake 构建文件
+CMakeCache.txt
+CMakeFiles/
+Makefile
+
+# 操作系统生成的文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 临时文件
+*.log
+*.tmp
+*.bak
+
+# 构建输出目录
+build/
+
+# 数据文件
+data/
