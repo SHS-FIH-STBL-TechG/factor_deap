@@ -157,7 +157,7 @@ factor_deap/
 在 PyCharm 右下角或 Terminal 中，激活虚拟环境后执行（示例）：
 
 ```bash
-pip install pandas numpy deap requests
+pip install pandas numpy deap requests matplotlib
 ```
 
 后续如有新增库，再按实际需要补。
@@ -348,5 +348,37 @@ python src/ai_factor_ic_scan.py
   - 计算收益曲线、夏普、最大回撤等指标。
 
 ---
+### （新增）：
+## IC 报告生成模块（ic_report.py）
 
-如后续你对某一组因子组合（例如 |IC| 较高，但 corr_full 接近 0 的情况）有疑问，或者希望在此基础上搭建自动回测和策略报告，可以在此 README 的基础上进一步拆分文档或补充示例。
+`ic_report.py` 用来基于已穷举好的因子组合，生成偏向研究报告风格的 **IC 分析报告**（Markdown + 图表）。
+
+它会：
+
+- 从 `results/factor_combo_cache.json.gz` 中读取每个标的的因子组合评估结果；
+- 重新加载对应的 CSV 数据，复算组合因子与目标（`未来1日涨跌幅`）的：
+  - 全样本 Pearson 相关系数 `corr_full`
+  - 滑动窗口 IC 序列（默认窗口 252 日）
+  - IC 绝对值均值 `ic_abs_mean`、IC 均值 `ic_mean`、IC 标准差 `ic_std`
+- 生成包含图表与文字说明的 Markdown 报告。
+
+---
+
+### 1. 前置条件
+
+运行 `ic_report.py` 之前需要：
+
+1. 已经跑过一次穷举扫描（`run_all.py` 的 Step 2）并生成缓存：  
+   - `results/factor_combo_cache.json.gz`
+2. `data/` 目录下存在对应标的的 CSV 文件（例如：`data/000001.SH-行情统计-20251117.csv`），格式与主流程一致。
+3. 已经有 `factors_generated.json` / `factors_generated.py`，确保可以复现 AI 因子。
+
+---
+
+### 2. 基本用法
+
+在项目根目录下（包含 `src/`、`data/`）运行：
+
+```bash
+# Windows 示例
+F:\work\factor_deap\.venv\Scripts\python.exe F:\work\factor_deap\src\ic_report.py

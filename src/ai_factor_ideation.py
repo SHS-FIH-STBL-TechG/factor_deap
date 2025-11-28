@@ -118,51 +118,124 @@ def build_prompt(existing_factor_names: List[str]) -> str:
 
 def filter_invalid_factors(factors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    用一个“虚拟 df”测试每个因子代码：
-    - 能执行且生成同名列 → 认为是有效因子
-    - 报错 / 不生成列 → 认为是“用不了的因子”，剔除
+    自检已有 AI 因子：
+    - 用一个“虚拟 df”（只包含基础行情字段）跑一遍因子代码；
+    - 如果项目根目录 data/ 下面有 csv，再用真实 sample df 再跑一遍；
+    - 任意一个 df 上：
+        * 执行报错，或者
+        * 执行成功但没有生成同名列
+      => 视为“无效因子”，从列表中剔除（并最终写回 JSON，相当于永久删除）。
     """
     if not factors:
         return []
 
-    n = 10
+    # ===== 1. 构造虚拟 df，只包含你 CSV 里的基础字段 =====
+    base_cols = [
+        "交易日期", "开盘点位", "最高点位", "最低点位",
+        "收盘价", "涨跌", "涨跌幅(%)", "开始日累计涨跌",
+        "开始日累计涨跌幅", "成交量(万股)", "成交额(万元)", "持仓量",
+    ]
+
+    n = 50  # 给自检 df 多一点行数，避免滚动窗口太小
     data = {
         "交易日期": pd.date_range("2000-01-01", periods=n, freq="D"),
     }
-    for col in BASE_COLS:
+    # 每个数值列弄成一个简单的递增序列，避免全是常数导致某些分位数/标准差计算出奇怪情况
+    for i, col in enumerate(base_cols):
         if col == "交易日期":
             continue
-        data[col] = [1.0] * n
+        data[col] = pd.Series(range(1, n + 1), dtype="float64") * (i + 1)
 
-    df_template = pd.DataFrame(data)
+    dummy_df = pd.DataFrame(data)
 
-    valid = []
-    removed = []
+    # ===== 2. 尝试加载一份“真实样本 df”（data/ 下第一张 csv，前若干行） =====
+    real_df = None
+    try:
+        root = Path(__file__).resolve().parent.parent   # 项目根目录
+        data_dir = root / "data"
+        csv_files = sorted(data_dir.glob("*.csv"))
+        if csv_files:
+            csv_path = csv_files[0]
+            try:
+                df_real = pd.read_csv(csv_path, encoding="utf-8")
+            except UnicodeDecodeError:
+                df_real = pd.read_csv(csv_path, encoding="gbk")
+
+            # 和 ai_factor_ic_scan 里一致，把数字列清洗成 float
+            numeric_cols = [
+                "开盘点位", "最高点位", "最低点位",
+                "收盘价", "涨跌", "涨跌幅(%)", "开始日累计涨跌",
+                "开始日累计涨跌幅", "成交量(万股)", "成交额(万元)", "持仓量",
+            ]
+            for col in numeric_cols:
+                if col not in df_real.columns:
+                    continue
+                df_real[col] = (
+                    df_real[col]
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.replace("%", "", regex=False)
+                    .str.replace("\t", "", regex=False)
+                    .str.strip()
+                )
+                df_real[col] = pd.to_numeric(df_real[col], errors="coerce")
+
+            if "交易日期" in df_real.columns:
+                df_real["交易日期"] = pd.to_datetime(df_real["交易日期"], errors="coerce")
+                df_real = df_real.sort_values("交易日期").reset_index(drop=True)
+
+            # 取前 500 行即可，用来测“真实分布”下的报错情况
+            real_df = df_real.head(500).copy()
+            logger.info("自检：使用 %s 作为真实样本 df。", csv_path.name)
+        else:
+            logger.info("自检：data/ 下没有找到 csv，仅使用虚拟 df 做因子自检。")
+    except Exception as e:
+        logger.info("自检阶段加载真实样本数据失败，仅使用虚拟 df：%s", e)
+        real_df = None
+
+    # ===== 3. 逐个因子在 dummy_df + real_df 上执行，判定是否有效 =====
+    valid: List[Dict[str, Any]] = []
+    removed: List[tuple] = []
 
     for fac in factors:
         name = fac.get("name")
         code = fac.get("code")
+
         if not name or not code:
             removed.append((name, "缺少 name 或 code"))
             continue
 
-        df_test = df_template.copy()
-        try:
-            # 这里要给 pd，否则 factor 里用 pd.xxx 会报错
-            exec(code, {"pd": pd}, {"df": df_test})
-        except Exception as e:
-            removed.append((name, f"执行报错: {e}"))
-            continue
+        is_valid = True
 
-        # 执行成功但没有生成同名列，也视为无效
-        if name not in df_test.columns:
-            removed.append((name, "执行成功但未生成同名列"))
-            continue
+        # 在两个 df 上都跑一遍：虚拟 df & 真实 sample df
+        for base_df in (dummy_df, real_df):
+            if base_df is None:
+                continue
 
-        valid.append(fac)
+            df_test = base_df.copy()
+            try:
+                # 如果因子代码访问了不存在的列 / 语法错误 / 运行时报错，都会在这里被捕获
+                exec(code, {"pd": pd}, {"df": df_test})
+            except Exception as e:
+                removed.append((name, f"在自检 df 上执行报错: {e}"))
+                is_valid = False
+                break
+
+            # 执行成功但没生成同名列，也视为无效
+            if name not in df_test.columns:
+                removed.append((name, "执行成功但未生成同名列"))
+                is_valid = False
+                break
+
+        if is_valid:
+            valid.append(fac)
 
     if removed:
-        logger.info("因子自检：共 %d 个已有因子，剔除无效因子 %d 个：", len(factors), len(removed))
+        logger.info(
+            "因子自检：共 %d 个已有因子，剔除无效因子 %d 个：",
+            len(factors),
+            len(removed),
+        )
         for name, reason in removed:
             logger.info("  - 删除因子 %s，原因：%s", name, reason)
 

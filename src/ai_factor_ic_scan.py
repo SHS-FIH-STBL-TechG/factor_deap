@@ -21,6 +21,16 @@ from typing import List, Dict, Any
 
 import pandas as pd
 
+import warnings
+
+# 屏蔽 pandas 在 nanops 中因为 NaN 导致的 RuntimeWarning，避免刷屏
+warnings.filterwarnings(
+    "ignore",
+    category=RuntimeWarning,
+    message="invalid value encountered in subtract",
+    module="pandas.core.nanops",
+)
+
 # 日志：优先使用你项目里的 logging_utils
 try:
     from logging_utils import get_logger
@@ -288,8 +298,13 @@ def scan_ai_factor_combinations_for_df(
     - 条件：ic_abs_mean > ic_threshold 或 corr_full > corr_threshold
     - 如果一个也没有，就输出 ic_abs_mean 最大的那个组合
 
-    组合结果缓存到 cache[symbol_name] 下，key 为 "因子A|因子B|..."。
+    注意：
+    - 只对“第一次计算”的组合进行数量限制（MAX_COMBOS_PER_SYMBOL）
+    - 已经在缓存里的组合：
+        * 不会再次调用 evaluate_combo（只读缓存结果）
+        * 也不会计入“新计算组合数量”，不会占用额度
     """
+
     ai_factors = get_ai_factor_names(df)
     logger.info("标的 %s 的 AI 因子数量：%d", symbol_name, len(ai_factors))
 
@@ -306,33 +321,40 @@ def scan_ai_factor_combinations_for_df(
     passed: List[Dict[str, Any]] = []
     best_overall: Dict[str, Any] | None = None
 
-    combos_evaluated = 0
+    total_seen = 0          # 总共“看过”的组合数量（包含缓存里的旧组合）
+    new_evals = 0           # 本次真正“新计算”的组合数量（只在 key 不在 cache 时增加）
     stop_early = False
 
     for k in range(2, max_k + 1):
         if stop_early:
             break
         logger.info("  枚举 %d 个因子的组合...", k)
+
         for combo_names in itertools.combinations(ai_factors, k):
+            total_seen += 1
+
             combo_list = list(combo_names)
             key = "|".join(combo_list)  # 组合的唯一标识
 
             if key in symbol_cache:
+                # 已经算过的组合：直接读缓存，不占 new_evals 上限
                 res = symbol_cache[key]
             else:
+                # 新组合：真正计算一次，并写入缓存
                 res = evaluate_combo(df, combo_list, window=window)
                 symbol_cache[key] = res
                 cache_changed = True
 
-            combos_evaluated += 1
-            if combos_evaluated >= MAX_COMBOS_PER_SYMBOL:
-                logger.warning(
-                    "标的 %s 已评估组合数量达到上限 %d，提前停止枚举。",
-                    symbol_name,
-                    MAX_COMBOS_PER_SYMBOL,
-                )
-                stop_early = True
-                break
+                new_evals += 1
+                if new_evals >= MAX_COMBOS_PER_SYMBOL:
+                    logger.warning(
+                        "标的 %s 本次新评估组合数量达到上限 %d，提前停止枚举（总扫描组合数=%d）。",
+                        symbol_name,
+                        MAX_COMBOS_PER_SYMBOL,
+                        total_seen,
+                    )
+                    stop_early = True
+                    break
 
             ic_abs = res["ic_abs_mean"]
             corr_full = res["corr_full"]
@@ -357,7 +379,12 @@ def scan_ai_factor_combinations_for_df(
     if cache_changed:
         logger.info("标的 %s 的组合结果已更新缓存。", symbol_name)
 
-    logger.info("=== 标的 %s 穷举结果（共评估组合 %d 个） ===", symbol_name, combos_evaluated)
+    logger.info(
+        "=== 标的 %s 穷举结果（共扫描组合 %d 个，其中新计算 %d 个） ===",
+        symbol_name,
+        total_seen,
+        new_evals,
+    )
 
     if passed:
         passed_sorted = sorted(
